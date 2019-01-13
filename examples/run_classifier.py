@@ -27,6 +27,7 @@ import random
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tensorboardX import SummaryWriter
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
@@ -476,8 +477,8 @@ def main():
     if n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
-    if not args.do_train and not args.do_eval:
-        raise ValueError("At least one of `do_train` or `do_eval` must be True.")
+    if not any((args.do_train, args.do_eval, args.do_test)):
+        raise ValueError("At least one of `do_train`, `do_eval`, `do_test` must be True.")
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train:
         raise ValueError("Output directory ({}) already exists and is not empty.".format(args.output_dir))
@@ -494,12 +495,12 @@ def main():
 
     tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
 
-    model = get_model(args, num_labels, device, n_gpu)
-
     global_step = 0
     loss = 0
     output_model_file = os.path.join(args.output_dir, "pytorch_model.bin")
     if args.do_train:
+        model = get_model(args, num_labels, device, n_gpu)
+
         tensorboard_log_dir = os.path.join(args.output_dir, './log')
         os.makedirs(tensorboard_log_dir, exist_ok=True)
         tensorboard_logger = SummaryWriter(tensorboard_log_dir)
@@ -525,10 +526,13 @@ def main():
         model = BertForSequenceClassification.from_pretrained(args.bert_model, state_dict=model_state_dict,
                                                               num_labels=num_labels)
         model.to(device)
+        if n_gpu > 1:
+            model = torch.nn.DataParallel(model)
 
         if args.do_eval:
             eval_data = prepare_eval(args, processor, label_list, tokenizer)
-            eval_loss, eval_accuracy = eval(args, model, eval_data, device, verbose=True)
+            eval_loss, eval_accuracy, eval_probs = eval(args, model, eval_data, device, verbose=True)
+            np.savetxt(os.path.join(args.output_dir, 'dev_probs.npy'), eval_probs)
             result.update({
                 'dev_loss': eval_loss,
                 'dev_accuracy': eval_accuracy,
@@ -536,7 +540,8 @@ def main():
 
         if args.do_test:
             eval_data = prepare_eval(args, processor, label_list, tokenizer, get_test=True)
-            eval_loss, eval_accuracy = eval(args, model, eval_data, device, verbose=True)
+            eval_loss, eval_accuracy, eval_probs = eval(args, model, eval_data, device, verbose=True)
+            np.savetxt(os.path.join(args.output_dir, 'test_probs.npy'), eval_probs)
             result.update({
                 'test_loss': eval_loss,
                 'test_accuracy': eval_accuracy,
@@ -691,7 +696,7 @@ def train(args,
                 global_step += 1
 
             if save_best_model and train_steps % args.eval_interval == 0:
-                eval_loss, eval_accuracy = eval(args, model, eval_data, device, verbose=False)
+                eval_loss, eval_accuracy, _ = eval(args, model, eval_data, device, verbose=False)
                 tensorboard_logger.add_scalar('dev_loss', eval_loss, train_steps)
                 tensorboard_logger.add_scalar('dev_accuracy', eval_accuracy, train_steps)
                 if eval_accuracy > best_eval_accuracy:
@@ -699,7 +704,7 @@ def train(args,
                     best_eval_accuracy = eval_accuracy
 
     if save_best_model:
-        eval_loss, eval_accuracy = eval(args, model, processor, label_list, tokenizer, device)
+        eval_loss, eval_accuracy, _ = eval(args, model, eval_data, device, verbose=False)
         if eval_accuracy > best_eval_accuracy:
             save_model(model, output_model_file)
     else:
@@ -737,6 +742,7 @@ def eval(args, model, eval_data, device, verbose=False):
     model.eval()
     eval_loss, eval_accuracy = 0, 0
     nb_eval_steps, nb_eval_examples = 0, 0
+    all_logits = []
 
     for input_ids, input_mask, segment_ids, label_ids in tqdm(eval_dataloader,
                                                               desc="Evaluating",
@@ -751,9 +757,12 @@ def eval(args, model, eval_data, device, verbose=False):
             tmp_eval_loss = model(input_ids, segment_ids, input_mask, label_ids)
             logits = model(input_ids, segment_ids, input_mask)
 
-        logits = logits.detach().cpu().numpy()
+        logits = logits.detach().cpu()
         label_ids = label_ids.to('cpu').numpy()
-        tmp_eval_accuracy = accuracy(logits, label_ids)
+        tmp_eval_accuracy = accuracy(logits.numpy(), label_ids)
+
+        if verbose:
+            all_logits.append(logits)
 
         eval_loss += tmp_eval_loss.mean().item()
         eval_accuracy += tmp_eval_accuracy
@@ -763,7 +772,11 @@ def eval(args, model, eval_data, device, verbose=False):
 
     eval_loss = eval_loss / nb_eval_steps
     eval_accuracy = eval_accuracy / nb_eval_examples
-    return eval_loss, eval_accuracy
+    eval_probs = None
+    if all_logits:
+        eval_probs = F.softmax(torch.cat(all_logits), dim=-1).numpy()
+
+    return eval_loss, eval_accuracy, eval_probs
 
 
 if __name__ == "__main__":
