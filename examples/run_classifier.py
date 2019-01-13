@@ -498,12 +498,16 @@ def main():
     global_step = 0
     loss = 0
     output_model_file = os.path.join(args.output_dir, "pytorch_model.bin")
+    eval_data = None
     if args.do_train:
         model = get_model(args, num_labels, device, n_gpu)
 
         tensorboard_log_dir = os.path.join(args.output_dir, './log')
         os.makedirs(tensorboard_log_dir, exist_ok=True)
         tensorboard_logger = SummaryWriter(tensorboard_log_dir)
+
+        if args.do_eval and do_eval_or_test(args):
+            eval_data = prepare_eval(args, processor, label_list, tokenizer)
 
         global_step, loss = train(args,
                                   model,
@@ -513,7 +517,8 @@ def main():
                                   tokenizer,
                                   device,
                                   n_gpu,
-                                  tensorboard_logger)
+                                  tensorboard_logger,
+                                  eval_data)
 
     if do_eval_or_test(args):
         result = {
@@ -530,7 +535,8 @@ def main():
             model = torch.nn.DataParallel(model)
 
         if args.do_eval:
-            eval_data = prepare_eval(args, processor, label_list, tokenizer)
+            if eval_data is None:
+                eval_data = prepare_eval(args, processor, label_list, tokenizer)
             eval_loss, eval_accuracy, eval_probs = eval(args, model, eval_data, device, verbose=True)
             np.savetxt(os.path.join(args.output_dir, 'dev_probs.npy'), eval_probs)
             result.update({
@@ -630,13 +636,12 @@ def train(args,
           tokenizer,
           device,
           n_gpu,
-          tensorboard_logger):
+          tensorboard_logger,
+          eval_data=None):
     global_step = 0
     nb_tr_steps = 0
     tr_loss = 0
-    save_best_model = do_eval_or_test(args) and args.eval_interval > 0
-    if save_best_model:
-        eval_data = prepare_eval(args, processor, label_list, tokenizer)
+    save_best_model = eval_data is not None and args.eval_interval > 0
 
     train_examples = processor.get_train_examples(args.data_dir)
     num_train_steps = int(
