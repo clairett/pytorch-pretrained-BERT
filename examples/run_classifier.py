@@ -33,8 +33,9 @@ from torch.utils.data import TensorDataset, DataLoader, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 
+from pytorch_pretrained_bert import BertForSequenceClassification
 from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
-from pytorch_pretrained_bert.modeling import BertForSequenceClassification
+from pytorch_pretrained_bert.modeling import env_enabled, ENV_OPENAIGPT_GELU, ENV_DISABLE_APEX
 from pytorch_pretrained_bert.optimization import BertAdam
 from pytorch_pretrained_bert.tokenization import BertTokenizer
 
@@ -203,6 +204,9 @@ class ColaProcessor(DataProcessor):
 class CustomProcessor(DataProcessor):
     """Processor for custom data set"""
 
+    def __init__(self, labels):
+        self.labels = labels
+
     def get_train_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
@@ -220,7 +224,7 @@ class CustomProcessor(DataProcessor):
 
     def get_labels(self):
         """See base class."""
-        return ["0", "1"]
+        return self.labels
 
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
@@ -335,7 +339,7 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
 
 
 def accuracy(out, labels):
-    outputs = np.argmax(out, axis=1)
+    outputs = np.argmax(out, axis=-1)
     return np.sum(outputs == labels)
 
 
@@ -355,9 +359,16 @@ def main():
                         required=True,
                         help="The input data dir. Should contain the .tsv files (or other data files) for the task.")
     parser.add_argument("--bert_model", default=None, type=str, required=True,
-                        help="Bert pre-trained model selected in the list: bert-base-uncased, "
-                             "bert-large-uncased, bert-base-cased, bert-large-cased, bert-base-multilingual-uncased, "
-                             "bert-base-multilingual-cased, bert-base-chinese.")
+                        choices=[
+                            "bert-base-uncased",
+                            "bert-large-uncased",
+                            "bert-base-cased",
+                            "bert-large-cased",
+                            "bert-base-multilingual-uncased",
+                            "bert-base-multilingual-cased",
+                            "bert-base-chinese",
+                        ],
+                        help="Bert pre-trained model selected in the list")
     parser.add_argument("--task_name",
                         default=None,
                         type=str,
@@ -368,6 +379,10 @@ def main():
                         type=str,
                         required=True,
                         help="The output directory where the model predictions and checkpoints will be written.")
+    parser.add_argument("--labels",
+                        nargs='+',
+                        default=['0', '1'],
+                        help="labels")
 
     ## Other parameters
     parser.add_argument("--max_seq_length",
@@ -385,6 +400,14 @@ def main():
     parser.add_argument("--do_test",
                         action='store_true',
                         help="Whether to run eval on the test set.")
+    parser.add_argument("--export_onnx",
+                        action='store_true',
+                        help="Whether to export model to onnx format.")
+    parser.add_argument("--onnx_framework",
+                        choices=[
+                            "caffe2",
+                        ],
+                        help="Select the ONNX framework to run eval")
     parser.add_argument("--eval_interval",
                         default=1000,
                         type=int,
@@ -443,14 +466,7 @@ def main():
         "cola": ColaProcessor,
         "mnli": MnliProcessor,
         "mrpc": MrpcProcessor,
-        "custom": CustomProcessor,
-    }
-
-    num_labels_task = {
-        "cola": 2,
-        "mnli": 3,
-        "mrpc": 2,
-        "custom": 2,
+        "custom": lambda: CustomProcessor(args.labels),
     }
 
     if args.local_rank == -1 or args.no_cuda:
@@ -477,8 +493,8 @@ def main():
     if n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
-    if not any((args.do_train, args.do_eval, args.do_test)):
-        raise ValueError("At least one of `do_train`, `do_eval`, `do_test` must be True.")
+    if not any((args.do_train, args.do_eval, args.do_test, args.export_onnx)):
+        raise ValueError("At least one of `do_train`, `do_eval`, `do_test`, `export_onnx` must be True.")
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train:
         raise ValueError("Output directory ({}) already exists and is not empty.".format(args.output_dir))
@@ -490,15 +506,17 @@ def main():
         raise ValueError("Task not found: %s" % (task_name))
 
     processor = processors[task_name]()
-    num_labels = num_labels_task[task_name]
     label_list = processor.get_labels()
+    num_labels = len(label_list)
 
     tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
 
     global_step = 0
     loss = 0
     output_model_file = os.path.join(args.output_dir, "pytorch_model.bin")
+    onnx_model_file = os.path.join(args.output_dir, "model.onnx")
     eval_data = None
+
     if args.do_train:
         model = get_model(args, num_labels, device, n_gpu)
 
@@ -520,18 +538,25 @@ def main():
                                   tensorboard_logger,
                                   eval_data)
 
+    else:
+        if args.onnx_framework is None:
+            # Load a trained model that you have fine-tuned
+            model_state_dict = torch.load(output_model_file)
+            model = BertForSequenceClassification.from_pretrained(args.bert_model, state_dict=model_state_dict,
+                                                                  num_labels=num_labels)
+            model.to(device)
+        else:
+            import onnx
+            model = onnx.load(onnx_model_file)
+            onnx.checker.check_model(model)
+
     if do_eval_or_test(args):
         result = {
             'global_step': global_step,
             'loss': loss
         }
 
-        # Load a trained model that you have fine-tuned
-        model_state_dict = torch.load(output_model_file)
-        model = BertForSequenceClassification.from_pretrained(args.bert_model, state_dict=model_state_dict,
-                                                              num_labels=num_labels)
-        model.to(device)
-        if n_gpu > 1:
+        if not args.no_cuda and n_gpu > 1 and isinstance(model, torch.nn.Module):
             model = torch.nn.DataParallel(model)
 
         if args.do_eval:
@@ -560,6 +585,31 @@ def main():
                 logger.info("  %s = %s", key, str(result[key]))
                 writer.write("%s = %s\n" % (key, str(result[key])))
 
+    if args.export_onnx:
+        if not env_enabled(ENV_OPENAIGPT_GELU) or not env_enabled(ENV_DISABLE_APEX):
+            raise ValueError('Both {} and {} must be 1 to properly export ONNX.'.format(ENV_OPENAIGPT_GELU,
+                                                                                        ENV_DISABLE_APEX))
+
+        if not isinstance(model, torch.nn.Module):
+            raise ValueError('model is not an instance of torch.nn.Module.')
+
+        dummy_features = convert_examples_to_features(
+            [InputExample(guid='dummy-0', text_a='Are you having fun?', text_b='Yes, I am!',
+                          label=processor.labels[0])],
+            label_list,
+            args.max_seq_length,
+            tokenizer)
+        dummy_input_ids = torch.tensor([f.input_ids for f in dummy_features], dtype=torch.long).to(device)
+        dummy_input_mask = torch.tensor([f.input_mask for f in dummy_features], dtype=torch.long).to(device)
+        dummy_segment_ids = torch.tensor([f.segment_ids for f in dummy_features], dtype=torch.long).to(device)
+        dummy_input = (dummy_input_ids, dummy_segment_ids, dummy_input_mask)
+        torch.onnx.export(model,
+                          dummy_input,
+                          onnx_model_file,
+                          input_names=['input_ids', 'input_mask', 'segment_ids'],
+                          output_names=['output_logit'],
+                          verbose=True)
+
 
 def do_eval_or_test(args):
     return (args.do_eval or args.do_test) and (args.local_rank == -1 or torch.distributed.get_rank() == 0)
@@ -570,19 +620,20 @@ def get_model(args, num_labels, device, n_gpu):
                                                           cache_dir=PYTORCH_PRETRAINED_BERT_CACHE / 'distributed_{}'.format(
                                                               args.local_rank),
                                                           num_labels=num_labels)
-    if args.fp16:
-        model.half()
-    model.to(device)
-    if args.local_rank != -1:
-        try:
-            from apex.parallel import DistributedDataParallel as DDP
-        except ImportError:
-            raise ImportError(
-                "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
+    if not args.no_cuda:
+        if args.fp16:
+            model.half()
+        model.to(device)
+        if args.local_rank != -1:
+            try:
+                from apex.parallel import DistributedDataParallel as DDP
+            except ImportError:
+                raise ImportError(
+                    "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
 
-        model = DDP(model)
-    elif n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+            model = DDP(model)
+        elif n_gpu > 1:
+            model = torch.nn.DataParallel(model)
 
     return model
 
@@ -737,6 +788,9 @@ def prepare_eval(args, processor, label_list, tokenizer, get_test=False):
 
 
 def eval(args, model, eval_data, device, verbose=False):
+    if not isinstance(model, torch.nn.Module):
+        return onnx_eval(args, model, eval_data, verbose=verbose)
+
     # Run prediction for full data
     if verbose:
         logger.info("***** Running evaluation *****")
@@ -744,10 +798,11 @@ def eval(args, model, eval_data, device, verbose=False):
         logger.info("  Batch size = %d", args.eval_batch_size)
     eval_dataloader = DataLoader(eval_data, shuffle=False, batch_size=args.eval_batch_size)
 
-    model.eval()
     eval_loss, eval_accuracy = 0, 0
     nb_eval_steps, nb_eval_examples = 0, 0
     all_logits = []
+
+    model.eval()
 
     for input_ids, input_mask, segment_ids, label_ids in tqdm(eval_dataloader,
                                                               desc="Evaluating",
@@ -782,6 +837,62 @@ def eval(args, model, eval_data, device, verbose=False):
         eval_probs = F.softmax(torch.cat(all_logits), dim=-1).numpy()
 
     return eval_loss, eval_accuracy, eval_probs
+
+
+def onnx_eval(args, onnx_model, eval_data, verbose=False):
+    # Run prediction for full data
+    args.eval_batch_size = 1
+    if verbose:
+        logger.info("***** Running evaluation *****")
+        logger.info("  Num examples = %d", len(eval_data))
+        logger.info("  Batch size = %d", args.eval_batch_size)
+    eval_dataloader = DataLoader(eval_data, shuffle=False, batch_size=args.eval_batch_size)
+
+    eval_loss, eval_accuracy = 0, 0
+    nb_eval_steps, nb_eval_examples = 0, 0
+    all_logits = []
+
+    if args.onnx_framework == 'caffe2':
+        import caffe2.python.onnx.backend as backend
+        prepared_backend = backend.prepare(onnx_model)
+        model = lambda x, y, z: prepared_backend.run((x, y, z))
+    else:
+        raise NotImplementedError(args.framework)
+
+    for input_ids, input_mask, segment_ids, label_ids in tqdm(eval_dataloader,
+                                                              desc="Evaluating",
+                                                              leave=verbose,
+                                                              dynamic_ncols=True):
+        input_ids = input_ids.numpy()
+        input_mask = input_mask.numpy()
+        segment_ids = segment_ids.numpy()
+        label_ids = label_ids.numpy()
+
+        logits = model(input_ids, segment_ids, input_mask)
+
+        tmp_eval_accuracy = accuracy(logits, label_ids)
+
+        if verbose:
+            all_logits.append(logits)
+
+        eval_accuracy += tmp_eval_accuracy
+
+        nb_eval_examples += input_ids.shape[0]
+        nb_eval_steps += 1
+
+    eval_accuracy = eval_accuracy / nb_eval_examples
+    eval_probs = None
+    if all_logits:
+        eval_probs = np_softmax(np.concatenate(all_logits)).squeeze()
+
+    return None, eval_accuracy, eval_probs
+
+
+def np_softmax(x, t=1):
+    x = x / t
+    x = x - np.max(x, axis=-1, keepdims=True)
+    ex = np.exp(x)
+    return ex / np.sum(ex, axis=-1, keepdims=True)
 
 
 if __name__ == "__main__":
