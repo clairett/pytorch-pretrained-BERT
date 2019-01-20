@@ -593,6 +593,9 @@ def main():
         if not isinstance(model, torch.nn.Module):
             raise ValueError('model is not an instance of torch.nn.Module.')
 
+        import onnx
+        import onnx.utils
+        import onnx.optimizer
         dummy_features = convert_examples_to_features(
             [InputExample(guid='dummy-0', text_a='Are you having fun?', text_b='Yes, I am!',
                           label=processor.labels[0])],
@@ -609,6 +612,11 @@ def main():
                           input_names=['input_ids', 'input_mask', 'segment_ids'],
                           output_names=['output_logit'],
                           verbose=True)
+        optimized_model = onnx.optimizer.optimize(onnx.load(onnx_model_file),
+                                                  [ pass_ for pass_ in onnx.optimizer.get_available_passes()
+                                                    if 'split' not in pass_])
+        optimized_model = onnx.utils.polish_model(optimized_model)
+        onnx.save(optimized_model, os.path.join(args.output_dir, 'optimized_model.onnx'))
 
 
 def do_eval_or_test(args):
