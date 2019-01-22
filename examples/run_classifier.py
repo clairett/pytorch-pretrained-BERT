@@ -525,7 +525,7 @@ def main():
         tensorboard_logger = SummaryWriter(tensorboard_log_dir)
 
         if args.do_eval and do_eval_or_test(args):
-            eval_data = prepare_eval(args, processor, label_list, tokenizer)
+            eval_data = prepare(args, processor, label_list, tokenizer, 'dev')
 
         global_step, loss = train(args,
                                   model,
@@ -538,17 +538,16 @@ def main():
                                   tensorboard_logger,
                                   eval_data)
 
+    if args.onnx_framework is None:
+        # Load a trained model that you have fine-tuned
+        model_state_dict = torch.load(output_model_file)
+        model = BertForSequenceClassification.from_pretrained(args.bert_model, state_dict=model_state_dict,
+                                                              num_labels=num_labels)
+        model.to(device)
     else:
-        if args.onnx_framework is None:
-            # Load a trained model that you have fine-tuned
-            model_state_dict = torch.load(output_model_file)
-            model = BertForSequenceClassification.from_pretrained(args.bert_model, state_dict=model_state_dict,
-                                                                  num_labels=num_labels)
-            model.to(device)
-        else:
-            import onnx
-            model = onnx.load(onnx_model_file)
-            onnx.checker.check_model(model)
+        import onnx
+        model = onnx.load(onnx_model_file)
+        onnx.checker.check_model(model)
 
     if do_eval_or_test(args):
         result = {
@@ -561,7 +560,7 @@ def main():
 
         if args.do_eval:
             if eval_data is None:
-                eval_data = prepare_eval(args, processor, label_list, tokenizer)
+                eval_data = prepare(args, processor, label_list, tokenizer, 'dev')
             eval_loss, eval_accuracy, eval_probs = eval(args, model, eval_data, device, verbose=True)
             np.savetxt(os.path.join(args.output_dir, 'dev_probs.npy'), eval_probs)
             result.update({
@@ -570,7 +569,7 @@ def main():
             })
 
         if args.do_test:
-            eval_data = prepare_eval(args, processor, label_list, tokenizer, get_test=True)
+            eval_data = prepare(args, processor, label_list, tokenizer, 'test')
             eval_loss, eval_accuracy, eval_probs = eval(args, model, eval_data, device, verbose=True)
             np.savetxt(os.path.join(args.output_dir, 'test_probs.npy'), eval_probs)
             result.update({
@@ -596,16 +595,7 @@ def main():
         import onnx
         import onnx.utils
         import onnx.optimizer
-        dummy_features = convert_examples_to_features(
-            [InputExample(guid='dummy-0', text_a='Are you having fun?', text_b='Yes, I am!',
-                          label=processor.labels[0])],
-            label_list,
-            args.max_seq_length,
-            tokenizer)
-        dummy_input_ids = torch.tensor([f.input_ids for f in dummy_features], dtype=torch.long).to(device)
-        dummy_input_mask = torch.tensor([f.input_mask for f in dummy_features], dtype=torch.long).to(device)
-        dummy_segment_ids = torch.tensor([f.segment_ids for f in dummy_features], dtype=torch.long).to(device)
-        dummy_input = (dummy_input_ids, dummy_segment_ids, dummy_input_mask)
+        dummy_input = get_dummy_input(args, processor, label_list, tokenizer, device)
         torch.onnx.export(model,
                           dummy_input,
                           onnx_model_file,
@@ -613,10 +603,24 @@ def main():
                           output_names=['output_logit'],
                           verbose=True)
         optimized_model = onnx.optimizer.optimize(onnx.load(onnx_model_file),
-                                                  [ pass_ for pass_ in onnx.optimizer.get_available_passes()
-                                                    if 'split' not in pass_])
+                                                  [pass_ for pass_ in onnx.optimizer.get_available_passes()
+                                                   if 'split' not in pass_])
         optimized_model = onnx.utils.polish_model(optimized_model)
         onnx.save(optimized_model, os.path.join(args.output_dir, 'optimized_model.onnx'))
+
+
+def get_dummy_input(args, processor, label_list, tokenizer, device):
+    dummy_features = convert_examples_to_features(
+        [InputExample(guid='dummy-0', text_a=' ', text_b=' ',
+                      label=processor.labels[0])],
+        label_list,
+        args.max_seq_length,
+        tokenizer)
+    dummy_input_ids = torch.tensor([f.input_ids for f in dummy_features], dtype=torch.long).to(device)
+    dummy_input_mask = torch.tensor([f.input_mask for f in dummy_features], dtype=torch.long).to(device)
+    dummy_segment_ids = torch.tensor([f.segment_ids for f in dummy_features], dtype=torch.long).to(device)
+    dummy_input = (dummy_input_ids, dummy_segment_ids, dummy_input_mask)
+    return dummy_input
 
 
 def do_eval_or_test(args):
@@ -707,17 +711,12 @@ def train(args,
         len(train_examples) / args.train_batch_size / args.gradient_accumulation_steps * args.num_train_epochs)
     optimizer, t_total = get_optimizer(args, model, num_train_steps)
 
-    train_features = convert_examples_to_features(
-        train_examples, label_list, args.max_seq_length, tokenizer, desc='Convert train examples')
+    train_data = prepare(args, processor, label_list, tokenizer, 'train')
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(train_examples))
     logger.info("  Batch size = %d", args.train_batch_size)
     logger.info("  Num steps = %d", num_train_steps)
-    all_input_ids = torch.tensor([f.input_ids for f in train_features], dtype=torch.long)
-    all_input_mask = torch.tensor([f.input_mask for f in train_features], dtype=torch.long)
-    all_segment_ids = torch.tensor([f.segment_ids for f in train_features], dtype=torch.long)
-    all_label_ids = torch.tensor([f.label_id for f in train_features], dtype=torch.long)
-    train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
+
     if args.local_rank == -1:
         train_sampler = RandomSampler(train_data)
     else:
@@ -777,21 +776,26 @@ def train(args,
     return global_step, tr_loss / nb_tr_steps
 
 
-def prepare_eval(args, processor, label_list, tokenizer, get_test=False):
-    if get_test:
+def prepare(args, processor, label_list, tokenizer, task):
+    if task == 'train':
+        eval_examples = processor.get_train_examples(args.data_dir)
+    elif task == 'dev':
+        eval_examples = processor.get_dev_examples(args.data_dir)
+    elif task == 'test':
         eval_examples = processor.get_test_examples(args.data_dir)
     else:
-        eval_examples = processor.get_dev_examples(args.data_dir)
-    eval_features = convert_examples_to_features(
+        raise NotImplementedError(task)
+
+    features = convert_examples_to_features(
         eval_examples,
         label_list,
         args.max_seq_length,
         tokenizer,
-        desc='Convert {} examples'.format('test' if get_test else 'dev'))
-    all_input_ids = torch.tensor([f.input_ids for f in eval_features], dtype=torch.long)
-    all_input_mask = torch.tensor([f.input_mask for f in eval_features], dtype=torch.long)
-    all_segment_ids = torch.tensor([f.segment_ids for f in eval_features], dtype=torch.long)
-    all_label_ids = torch.tensor([f.label_id for f in eval_features], dtype=torch.long)
+        desc='Convert {} examples'.format(task))
+    all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
+    all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
+    all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
+    all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.long)
     return TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
 
 
