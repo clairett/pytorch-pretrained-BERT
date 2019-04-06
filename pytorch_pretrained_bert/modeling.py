@@ -533,7 +533,7 @@ class PreTrainedBertModel(nn.Module):
         model = cls(config, *inputs, **kwargs)
         if state_dict is None:
             weights_path = os.path.join(serialization_dir, WEIGHTS_NAME)
-            state_dict = torch.load(weights_path)
+            state_dict = torch.load(weights_path, map_location=lambda storage, loc: storage)
 
         old_keys = []
         new_keys = []
@@ -1148,3 +1148,52 @@ class BertForQuestionAnswering(PreTrainedBertModel):
             return total_loss
         else:
             return start_logits, end_logits
+
+
+class BlendCNN(nn.Module):
+    "Blend CNN in https://openreview.net/pdf?id=HJxM3hftiX"
+
+    def __init__(self,
+                 cfg,
+                 num_labels,
+                 channels,
+                 kernel_sizes=5,
+                 n_hidden_dense=768):
+        super().__init__()
+        if not isinstance(kernel_sizes, tuple) and not isinstance(kernel_sizes, list):
+            kernel_sizes = (kernel_sizes,) * (len(channels) - 1)
+        elif len(kernel_sizes) != len(channels) - 1:
+            raise ValueError('len(kernel_sizes) must match {}'.format(len(channels) - 1))
+
+        if not isinstance(n_hidden_dense, tuple) and not isinstance(n_hidden_dense, list):
+            n_hidden_dense = (n_hidden_dense,)
+
+        self.num_labels = num_labels
+        self.embed = BertEmbeddings(cfg)
+        self.convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(in_channels=n_in, out_channels=n_out, kernel_size=k, padding=k // 2),
+                nn.ReLU(),
+            )
+            for n_in, n_out, k in zip(channels[:-1], channels[1:], kernel_sizes)
+        ])
+        self.dense = nn.Sequential(
+            *(nn.Sequential(nn.Linear(in_features=in_f, out_features=out_f), nn.ReLU())
+              for in_f, out_f in zip((channels[-1] * len(kernel_sizes),) + n_hidden_dense, n_hidden_dense)),
+            nn.Linear(n_hidden_dense[-1], num_labels)
+        )
+
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None):
+        h = self.embed(input_ids, token_type_ids).transpose(1, 2)
+        output = []
+        for conv in self.convs:
+            h = conv(h)
+            output.append(nn.AdaptiveMaxPool1d(output_size=1)(h).squeeze())
+            h = nn.MaxPool1d(kernel_size=2)(h)
+        logits = self.dense(torch.cat(output, -1))
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            return loss
+        else:
+            return logits

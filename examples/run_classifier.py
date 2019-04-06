@@ -20,22 +20,27 @@ from __future__ import division
 from __future__ import print_function
 
 import argparse
+import concurrent.futures
 import csv
 import logging
 import os
 import random
+from functools import partial
 
+import distiller
 import numpy as np
+import sys
 import torch
 import torch.nn.functional as F
 from tensorboardX import SummaryWriter
+from torch.nn import CrossEntropyLoss
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 
 from pytorch_pretrained_bert import BertForSequenceClassification
 from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
-from pytorch_pretrained_bert.modeling import env_enabled, ENV_OPENAIGPT_GELU, ENV_DISABLE_APEX
+from pytorch_pretrained_bert.modeling import env_enabled, ENV_OPENAIGPT_GELU, ENV_DISABLE_APEX, BlendCNN
 from pytorch_pretrained_bert.optimization import BertAdam
 from pytorch_pretrained_bert.tokenization import BertTokenizer
 
@@ -239,13 +244,8 @@ class CustomProcessor(DataProcessor):
         return examples
 
 
-def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer, desc=None):
-    """Loads a data file into a list of `InputBatch`s."""
-
-    label_map = {label: i for i, label in enumerate(label_list)}
-
-    features = []
-    for (ex_index, example) in enumerate(tqdm(examples, dynamic_ncols=True, desc=desc)):
+def convert_example_to_feature(example, label_map, max_seq_length, tokenizer):
+    try:
         tokens_a = tokenizer.tokenize(example.text_a)
 
         tokens_b = None
@@ -301,24 +301,54 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
         assert len(input_mask) == max_seq_length
         assert len(segment_ids) == max_seq_length
 
-        label_id = label_map[example.label]
-        if ex_index < 5:
-            logger.debug("*** Example ***")
-            logger.debug("guid: %s" % (example.guid))
-            logger.debug("tokens: %s" % " ".join(
-                [str(x) for x in tokens]))
-            logger.debug("input_ids: %s" % " ".join([str(x) for x in input_ids]))
-            logger.debug("input_mask: %s" % " ".join([str(x) for x in input_mask]))
-            logger.debug(
-                "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
-            logger.debug("label: %s (id = %d)" % (example.label, label_id))
+        label_id = None
+        if example.label is not None:
+            label_id = label_map[example.label]
 
-        features.append(
-            InputFeatures(input_ids=input_ids,
-                          input_mask=input_mask,
-                          segment_ids=segment_ids,
-                          label_id=label_id))
-    return features
+        return InputFeatures(input_ids=input_ids,
+                             input_mask=input_mask,
+                             segment_ids=segment_ids,
+                             label_id=label_id)
+    except Exception as err:
+        print('Encountered error when converting {}: {}'.format(example, err), file=sys.stderr)
+        zeros = [0] * max_seq_length
+        return InputFeatures(input_ids=zeros,
+                             input_mask=zeros,
+                             segment_ids=zeros,
+                             label_id=None)
+
+
+def convert_examples_to_features(examples,
+                                 label_list,
+                                 max_seq_length,
+                                 tokenizer,
+                                 num_workers=0,
+                                 desc=None,
+                                 verbose=False):
+    """Loads a data file into a list of `InputBatch`s."""
+
+    label_map = {label: i for i, label in enumerate(label_list)}
+    iterable = examples
+    convert = partial(convert_example_to_feature,
+                      label_map=label_map,
+                      max_seq_length=max_seq_length,
+                      tokenizer=tokenizer)
+
+    if num_workers > 0:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+            if verbose:
+                iterable = tqdm(examples, dynamic_ncols=True, desc='Submit jobs')
+            iterable = executor.map(convert,
+                                    iterable,
+                                    chunksize=max(512, len(examples) // num_workers // num_workers))
+            if verbose:
+                iterable = tqdm(iterable, dynamic_ncols=True, desc=desc, total=len(examples))
+            return list(iterable)
+    else:
+        if verbose:
+            iterable = tqdm(examples, dynamic_ncols=True, desc=desc)
+
+        return list(map(convert, iterable))
 
 
 def _truncate_seq_pair(tokens_a, tokens_b, max_length):
@@ -400,6 +430,13 @@ def main():
     parser.add_argument("--do_test",
                         action='store_true',
                         help="Whether to run eval on the test set.")
+    parser.add_argument("--do_distill",
+                        action='store_true',
+                        help="Whether to run distillation.")
+    parser.add_argument("--blendcnn_channels",
+                        nargs='+',
+                        default=(100,) * 8,
+                        help="BlendCNN channels.")
     parser.add_argument("--export_onnx",
                         action='store_true',
                         help="Whether to export model to onnx format.")
@@ -460,6 +497,7 @@ def main():
                              "0 (default value): dynamic loss scaling.\n"
                              "Positive power of 2: static loss scaling value.\n")
 
+    distiller.knowledge_distillation.add_distillation_args(parser)
     args = parser.parse_args()
 
     processors = {
@@ -493,8 +531,8 @@ def main():
     if n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
-    if not any((args.do_train, args.do_eval, args.do_test, args.export_onnx)):
-        raise ValueError("At least one of `do_train`, `do_eval`, `do_test`, `export_onnx` must be True.")
+    if not any((args.do_train, args.do_eval, args.do_test, args.do_distill, args.export_onnx)):
+        raise ValueError("At least one of `do_train`, `do_eval`, `do_test`, `do_distill`, `export_onnx` must be True.")
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train:
         raise ValueError("Output directory ({}) already exists and is not empty.".format(args.output_dir))
@@ -518,13 +556,17 @@ def main():
     eval_data = None
 
     if args.do_train:
-        model = get_model(args, num_labels, device, n_gpu)
+        model = BertForSequenceClassification.from_pretrained(args.bert_model,
+                                                              cache_dir=PYTORCH_PRETRAINED_BERT_CACHE / 'distributed_{}'.format(
+                                                                  args.local_rank),
+                                                              num_labels=num_labels)
+        model = convert_model(args, model, device, n_gpu)
 
         tensorboard_log_dir = os.path.join(args.output_dir, './log')
         os.makedirs(tensorboard_log_dir, exist_ok=True)
         tensorboard_logger = SummaryWriter(tensorboard_log_dir)
 
-        if args.do_eval and do_eval_or_test(args):
+        if args.do_eval and do_eval_or_test(args) and eval_data is None:
             eval_data = prepare(args, processor, label_list, tokenizer, 'dev')
 
         global_step, loss = train(args,
@@ -538,25 +580,62 @@ def main():
                                   tensorboard_logger,
                                   eval_data)
 
+    model_config = None
     if args.onnx_framework is None:
         # Load a trained model that you have fine-tuned
-        model_state_dict = torch.load(output_model_file)
-        model = BertForSequenceClassification.from_pretrained(args.bert_model, state_dict=model_state_dict,
+        model_state_dict = torch.load(output_model_file, map_location=lambda storage, loc: storage)
+        model = BertForSequenceClassification.from_pretrained(args.bert_model,
+                                                              state_dict=model_state_dict,
                                                               num_labels=num_labels)
-        model.to(device)
+        model_config = model.config
+        model = convert_model(args, model, device, n_gpu)
     else:
         import onnx
         model = onnx.load(onnx_model_file)
         onnx.checker.check_model(model)
+
+    if args.do_distill:
+        assert model_config is not None
+        output_distilled_model_file = os.path.join(args.output_dir, "pytorch_distilled_model.bin")
+        teacher = model
+        student = BlendCNN(model_config,
+                           num_labels=num_labels,
+                           channels=(model_config.hidden_size,) + args.blendcnn_channels,
+                           n_hidden_dense=(model_config.hidden_size,) * 2)
+
+        student = convert_model(args, student, device, 1)
+        if os.path.exists(output_distilled_model_file):
+            logger.info(
+                'Loading existing distilled model {}, skipping distillation'.format(output_distilled_model_file))
+            student.load_state_dict(torch.load(output_distilled_model_file))
+        else:
+            dlw = distiller.DistillationLossWeights(args.kd_distill_wt, args.kd_student_wt, args.kd_teacher_wt)
+            args.kd_policy = distiller.KnowledgeDistillationPolicy(student, teacher, args.kd_temp, dlw)
+
+            tensorboard_log_dir = os.path.join(args.output_dir, './log')
+            os.makedirs(tensorboard_log_dir, exist_ok=True)
+            tensorboard_logger = SummaryWriter(tensorboard_log_dir)
+
+            if args.do_eval and do_eval_or_test(args) and eval_data is None:
+                eval_data = prepare(args, processor, label_list, tokenizer, 'dev')
+
+            global_step, loss = distill(args,
+                                        output_distilled_model_file,
+                                        processor,
+                                        label_list,
+                                        tokenizer,
+                                        device,
+                                        n_gpu,
+                                        tensorboard_logger,
+                                        eval_data)
+        model = student
 
     if do_eval_or_test(args):
         result = {
             'global_step': global_step,
             'loss': loss
         }
-
-        if not args.no_cuda and n_gpu > 1 and isinstance(model, torch.nn.Module):
-            model = torch.nn.DataParallel(model)
+        model.float()
 
         if args.do_eval:
             if eval_data is None:
@@ -627,11 +706,7 @@ def do_eval_or_test(args):
     return (args.do_eval or args.do_test) and (args.local_rank == -1 or torch.distributed.get_rank() == 0)
 
 
-def get_model(args, num_labels, device, n_gpu):
-    model = BertForSequenceClassification.from_pretrained(args.bert_model,
-                                                          cache_dir=PYTORCH_PRETRAINED_BERT_CACHE / 'distributed_{}'.format(
-                                                              args.local_rank),
-                                                          num_labels=num_labels)
+def convert_model(args, model, device, n_gpu):
     if not args.no_cuda:
         if args.fp16:
             model.half()
@@ -791,7 +866,9 @@ def prepare(args, processor, label_list, tokenizer, task):
         label_list,
         args.max_seq_length,
         tokenizer,
-        desc='Convert {} examples'.format(task))
+        num_workers=os.cpu_count() // 2,
+        desc='Convert {} examples'.format(task),
+        verbose=True)
     all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
     all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
     all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
@@ -849,6 +926,101 @@ def eval(args, model, eval_data, device, verbose=False):
         eval_probs = F.softmax(torch.cat(all_logits), dim=-1).numpy()
 
     return eval_loss, eval_accuracy, eval_probs
+
+
+def distill(args,
+            output_model_file,
+            processor,
+            label_list,
+            tokenizer,
+            device,
+            n_gpu,
+            tensorboard_logger,
+            eval_data=None):
+    assert args.kd_policy is not None
+    model = args.kd_policy.student
+    args.kd_policy.teacher.eval()
+    num_labels = len(args.labels)
+
+    global_step = 0
+    nb_tr_steps = 0
+    tr_loss = 0
+    save_best_model = eval_data is not None and args.eval_interval > 0
+
+    train_examples = processor.get_train_examples(args.data_dir)
+    num_train_steps = int(
+        len(train_examples) / args.train_batch_size / args.gradient_accumulation_steps * args.num_train_epochs)
+    optimizer, t_total = get_optimizer(args, model, num_train_steps)
+
+    train_data = prepare(args, processor, label_list, tokenizer, 'train')
+    logger.info("***** Running distillation *****")
+    logger.info("  Num examples = %d", len(train_examples))
+    logger.info("  Batch size = %d", args.train_batch_size)
+    logger.info("  Num steps = %d", num_train_steps)
+
+    if args.local_rank == -1:
+        train_sampler = RandomSampler(train_data)
+    else:
+        train_sampler = DistributedSampler(train_data)
+    train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size)
+
+    train_steps = 0
+    best_eval_accuracy = 0
+    for epoch in trange(int(args.num_train_epochs), desc="Epoch", dynamic_ncols=True):
+        tr_loss = 0
+        nb_tr_examples, nb_tr_steps = 0, 0
+        args.kd_policy.on_epoch_begin(model, None, None)
+
+        for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration", dynamic_ncols=True)):
+            batch = tuple(t.to(device) for t in batch)
+            input_ids, input_mask, segment_ids, label_ids = batch
+            model.train()
+            logits = args.kd_policy.forward(input_ids, segment_ids, input_mask)
+            loss = CrossEntropyLoss()(logits.view(-1, num_labels), label_ids.view(-1))
+            loss = args.kd_policy.before_backward_pass(model, epoch, None, None, loss, None).overall_loss
+            if n_gpu > 1:
+                loss = loss.mean()  # mean() to average on multi-gpu.
+            if args.gradient_accumulation_steps > 1:
+                loss = loss / args.gradient_accumulation_steps
+
+            if args.fp16:
+                optimizer.backward(loss)
+            else:
+                loss.backward()
+
+            train_steps += 1
+            tensorboard_logger.add_scalar('distillation_train_loss', loss.item(), train_steps)
+
+            tr_loss += loss.item()
+            nb_tr_examples += input_ids.size(0)
+            nb_tr_steps += 1
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                # modify learning rate with special warm up BERT uses
+                lr_this_step = args.learning_rate * warmup_linear(global_step / t_total, args.warmup_proportion)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr_this_step
+                optimizer.step()
+                optimizer.zero_grad()
+                global_step += 1
+
+            if save_best_model and train_steps % args.eval_interval == 0:
+                eval_loss, eval_accuracy, _ = eval(args, model, eval_data, device, verbose=False)
+                tensorboard_logger.add_scalar('distillation_dev_loss', eval_loss, train_steps)
+                tensorboard_logger.add_scalar('distillation_dev_accuracy', eval_accuracy, train_steps)
+                if eval_accuracy > best_eval_accuracy:
+                    save_model(model, output_model_file)
+                    best_eval_accuracy = eval_accuracy
+
+        args.kd_policy.on_epoch_end(model, None, None)
+
+    if save_best_model:
+        eval_loss, eval_accuracy, _ = eval(args, model, eval_data, device, verbose=False)
+        if eval_accuracy > best_eval_accuracy:
+            save_model(model, output_model_file)
+    else:
+        save_model(model, output_model_file)
+
+    return global_step, tr_loss / nb_tr_steps
 
 
 def onnx_eval(args, onnx_model, eval_data, verbose=False):

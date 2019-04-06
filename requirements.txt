@@ -8,3 +8,5 @@ boto3
 requests
 # TensorboardX
 tensorboardx
+# Distiller
+-e git+git@github.com:NervanaSystems/distiller.git#egg=distiller
