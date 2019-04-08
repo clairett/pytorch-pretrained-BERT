@@ -25,11 +25,11 @@ import csv
 import logging
 import os
 import random
+import sys
 from functools import partial
 
 import distiller
 import numpy as np
-import sys
 import torch
 import torch.nn.functional as F
 from tensorboardX import SummaryWriter
@@ -40,7 +40,8 @@ from tqdm import tqdm, trange
 
 from pytorch_pretrained_bert import BertForSequenceClassification
 from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
-from pytorch_pretrained_bert.modeling import env_enabled, ENV_OPENAIGPT_GELU, ENV_DISABLE_APEX, BlendCNN
+from pytorch_pretrained_bert.modeling import env_enabled, ENV_OPENAIGPT_GELU, ENV_DISABLE_APEX, BlendCNN, \
+    BlendCNNForSequencePairClassification
 from pytorch_pretrained_bert.optimization import BertAdam
 from pytorch_pretrained_bert.tokenization import BertTokenizer
 
@@ -437,6 +438,9 @@ def main():
                         nargs='+',
                         default=(100,) * 8,
                         help="BlendCNN channels.")
+    parser.add_argument('--blendcnn_pair',
+                        action='store_true',
+                        help="Whether to use BlendCNNForSequencePairClassification")
     parser.add_argument("--export_onnx",
                         action='store_true',
                         help="Whether to export model to onnx format.")
@@ -581,6 +585,7 @@ def main():
                                   eval_data)
 
     model_config = None
+    model_embeddings = None
     if args.onnx_framework is None:
         # Load a trained model that you have fine-tuned
         model_state_dict = torch.load(output_model_file, map_location=lambda storage, loc: storage)
@@ -588,6 +593,7 @@ def main():
                                                               state_dict=model_state_dict,
                                                               num_labels=num_labels)
         model_config = model.config
+        model_embeddings = model.bert.embeddings
         model = convert_model(args, model, device, n_gpu)
     else:
         import onnx
@@ -596,12 +602,21 @@ def main():
 
     if args.do_distill:
         assert model_config is not None
+        assert model_embeddings is not None
         output_distilled_model_file = os.path.join(args.output_dir, "pytorch_distilled_model.bin")
         teacher = model
-        student = BlendCNN(model_config,
-                           num_labels=num_labels,
-                           channels=(model_config.hidden_size,) + args.blendcnn_channels,
-                           n_hidden_dense=(model_config.hidden_size,) * 2)
+        if args.blendcnn_pair:
+            student = BlendCNNForSequencePairClassification(model_config,
+                                                            num_labels=num_labels,
+                                                            channels=(model_config.hidden_size,) +
+                                                                     args.blendcnn_channels,
+                                                            n_hidden_dense=(model_config.hidden_size,) * 2)
+        else:
+            student = BlendCNN(model_config,
+                               num_labels=num_labels,
+                               channels=(model_config.hidden_size,) + args.blendcnn_channels,
+                               n_hidden_dense=(model_config.hidden_size,) * 2)
+        student.embeddings.load_state_dict(model_embeddings.state_dict())
 
         student = convert_model(args, student, device, 1)
         if os.path.exists(output_distilled_model_file):
@@ -636,24 +651,25 @@ def main():
             'loss': loss
         }
         model.float()
+        name = '_distiller' if args.do_distill else ''
 
         if args.do_eval:
             if eval_data is None:
                 eval_data = prepare(args, processor, label_list, tokenizer, 'dev')
             eval_loss, eval_accuracy, eval_probs = eval(args, model, eval_data, device, verbose=True)
-            np.savetxt(os.path.join(args.output_dir, 'dev_probs.npy'), eval_probs)
+            np.savetxt(os.path.join(args.output_dir, 'dev{}_probs.npy'.format(name)), eval_probs)
             result.update({
-                'dev_loss': eval_loss,
-                'dev_accuracy': eval_accuracy,
+                'dev{}_loss'.format(name): eval_loss,
+                'dev{}_accuracy'.format(name): eval_accuracy,
             })
 
         if args.do_test:
             eval_data = prepare(args, processor, label_list, tokenizer, 'test')
             eval_loss, eval_accuracy, eval_probs = eval(args, model, eval_data, device, verbose=True)
-            np.savetxt(os.path.join(args.output_dir, 'test_probs.npy'), eval_probs)
+            np.savetxt(os.path.join(args.output_dir, 'test{}_probs.npy'.format(name)), eval_probs)
             result.update({
-                'test_loss': eval_loss,
-                'test_accuracy': eval_accuracy,
+                'test{}_loss'.format(name): eval_loss,
+                'test{}_accuracy'.format(name): eval_accuracy,
             })
 
         output_eval_file = os.path.join(args.output_dir, "eval_results.txt")

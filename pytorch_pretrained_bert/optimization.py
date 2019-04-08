@@ -166,16 +166,3 @@ class BertAdam(Optimizer):
                 # bias_correction2 = 1 - beta2 ** state['step']
 
         return loss
-
-
-def selective_weight_decay_optimizer(cfg, model):
-    """ optimizer for GPU training """
-    param_optimizer = list(model.named_parameters())
-    no_decay = ['bias', 'gamma', 'beta']
-    optimizer_grouped_parameters = [
-        {'params': [p for n, p in param_optimizer if n not in no_decay], 'weight_decay_rate': 0.01},
-        {'params': [p for n, p in param_optimizer if n in no_decay], 'weight_decay_rate': 0.0}]
-    return BertAdam(optimizer_grouped_parameters,
-                    lr=cfg.lr,
-                    warmup=cfg.warmup,
-                    t_total=cfg.total_steps)

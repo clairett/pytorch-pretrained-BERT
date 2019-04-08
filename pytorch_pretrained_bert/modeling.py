@@ -1169,7 +1169,7 @@ class BlendCNN(nn.Module):
             n_hidden_dense = (n_hidden_dense,)
 
         self.num_labels = num_labels
-        self.embed = BertEmbeddings(cfg)
+        self.embeddings = BertEmbeddings(cfg)
         self.convs = nn.ModuleList([
             nn.Sequential(
                 nn.Conv1d(in_channels=n_in, out_channels=n_out, kernel_size=k, padding=k // 2),
@@ -1184,12 +1184,62 @@ class BlendCNN(nn.Module):
         )
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None):
-        h = self.embed(input_ids, token_type_ids).transpose(1, 2)
+        h = self.embeddings(input_ids, token_type_ids).transpose(1, 2)
         output = []
         for conv in self.convs:
             h = conv(h)
             output.append(nn.AdaptiveMaxPool1d(output_size=1)(h).squeeze())
             h = nn.MaxPool1d(kernel_size=2)(h)
+        logits = self.dense(torch.cat(output, -1))
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            return loss
+        else:
+            return logits
+
+
+class BlendCNNForSequencePairClassification(nn.Module):
+    def __init__(self,
+                 cfg,
+                 num_labels,
+                 channels,
+                 kernel_sizes=5,
+                 n_hidden_dense=768):
+        super().__init__()
+        if not isinstance(kernel_sizes, tuple) and not isinstance(kernel_sizes, list):
+            kernel_sizes = (kernel_sizes,) * (len(channels) - 1)
+        elif len(kernel_sizes) != len(channels) - 1:
+            raise ValueError('len(kernel_sizes) must match {}'.format(len(channels) - 1))
+
+        if not isinstance(n_hidden_dense, tuple) and not isinstance(n_hidden_dense, list):
+            n_hidden_dense = (n_hidden_dense,)
+
+        self.num_labels = num_labels
+        self.embeddings = BertEmbeddings(cfg)
+        self.convs = nn.ModuleList([nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(in_channels=n_in, out_channels=n_out, kernel_size=k, padding=k // 2),
+                nn.ReLU(),
+            )
+            for n_in, n_out, k in zip(channels[:-1], channels[1:], kernel_sizes)
+        ]) for _ in range(2)])
+        self.dense = nn.Sequential(
+            *(nn.Sequential(nn.Linear(in_features=in_f, out_features=out_f), nn.ReLU())
+              for in_f, out_f in zip((channels[-1] * len(kernel_sizes) * 2,) + n_hidden_dense, n_hidden_dense)),
+            nn.Linear(n_hidden_dense[-1], num_labels)
+        )
+
+    def forward(self, input_ids, token_type_ids, attention_mask=None, labels=None):
+        h = self.embeddings(input_ids, token_type_ids).transpose(1, 2)
+        mask = token_type_ids.unsqueeze(1).repeat(1, h.shape[1], 1)
+        output = []
+        for i, conv_list in enumerate(self.convs):
+            current_h = h * (mask == i).float()
+            for conv in conv_list:
+                current_h = conv(current_h)
+                output.append(nn.AdaptiveMaxPool1d(output_size=1)(current_h).squeeze())
+                current_h = nn.MaxPool1d(kernel_size=2)(current_h)
         logits = self.dense(torch.cat(output, -1))
         if labels is not None:
             loss_fct = CrossEntropyLoss()
