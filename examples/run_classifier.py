@@ -41,7 +41,7 @@ from tqdm import tqdm, trange
 from pytorch_pretrained_bert import BertForSequenceClassification
 from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
 from pytorch_pretrained_bert.modeling import env_enabled, ENV_OPENAIGPT_GELU, ENV_DISABLE_APEX, BlendCNN, \
-    BlendCNNForSequencePairClassification
+    BlendCNNForSequencePairClassification, DISTILLER_WEIGHTS_NAME, WEIGHTS_NAME
 from pytorch_pretrained_bert.optimization import BertAdam
 from pytorch_pretrained_bert.tokenization import BertTokenizer
 
@@ -438,6 +438,9 @@ def main():
                         nargs='+',
                         default=(100,) * 8,
                         help="BlendCNN channels.")
+    parser.add_argument('--blendcnn_dropout',
+                        action='store_true',
+                        help="Whether to use dropout in BlendCNN")
     parser.add_argument('--blendcnn_pair',
                         action='store_true',
                         help="Whether to use BlendCNNForSequencePairClassification")
@@ -555,7 +558,7 @@ def main():
 
     global_step = 0
     loss = 0
-    output_model_file = os.path.join(args.output_dir, "pytorch_model.bin")
+    output_model_file = os.path.join(args.output_dir, WEIGHTS_NAME)
     onnx_model_file = os.path.join(args.output_dir, "model.onnx")
     eval_data = None
 
@@ -588,7 +591,10 @@ def main():
     model_embeddings = None
     if args.onnx_framework is None:
         # Load a trained model that you have fine-tuned
-        model_state_dict = torch.load(output_model_file, map_location=lambda storage, loc: storage)
+        if os.path.exists(output_model_file):
+            model_state_dict = torch.load(output_model_file, map_location=lambda storage, loc: storage)
+        else:
+            model_state_dict = None
         model = BertForSequenceClassification.from_pretrained(args.bert_model,
                                                               state_dict=model_state_dict,
                                                               num_labels=num_labels)
@@ -603,19 +609,21 @@ def main():
     if args.do_distill:
         assert model_config is not None
         assert model_embeddings is not None
-        output_distilled_model_file = os.path.join(args.output_dir, "pytorch_distilled_model.bin")
+        output_distilled_model_file = os.path.join(args.output_dir, DISTILLER_WEIGHTS_NAME)
         teacher = model
         if args.blendcnn_pair:
             student = BlendCNNForSequencePairClassification(model_config,
                                                             num_labels=num_labels,
                                                             channels=(model_config.hidden_size,) +
                                                                      args.blendcnn_channels,
-                                                            n_hidden_dense=(model_config.hidden_size,) * 2)
+                                                            n_hidden_dense=(model_config.hidden_size,) * 2,
+                                                            use_dropout=args.blendcnn_dropout)
         else:
             student = BlendCNN(model_config,
                                num_labels=num_labels,
                                channels=(model_config.hidden_size,) + args.blendcnn_channels,
-                               n_hidden_dense=(model_config.hidden_size,) * 2)
+                               n_hidden_dense=(model_config.hidden_size,) * 2,
+                               use_dropout=args.blendcnn_dropout)
         student.embeddings.load_state_dict(model_embeddings.state_dict())
 
         student = convert_model(args, student, device, 1)

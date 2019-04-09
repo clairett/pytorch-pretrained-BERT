@@ -47,6 +47,7 @@ PRETRAINED_MODEL_ARCHIVE_MAP = {
 }
 CONFIG_NAME = 'bert_config.json'
 WEIGHTS_NAME = 'pytorch_model.bin'
+DISTILLER_WEIGHTS_NAME = 'pytorch_distilled_model.bin'
 
 ENV_OPENAIGPT_GELU = 'OPENAIGPT_GELU'
 ENV_DISABLE_APEX = 'DISABLE_APEX'
@@ -1158,7 +1159,8 @@ class BlendCNN(nn.Module):
                  num_labels,
                  channels,
                  kernel_sizes=5,
-                 n_hidden_dense=768):
+                 n_hidden_dense=768,
+                 use_dropout=False):
         super().__init__()
         if not isinstance(kernel_sizes, tuple) and not isinstance(kernel_sizes, list):
             kernel_sizes = (kernel_sizes,) * (len(channels) - 1)
@@ -1177,11 +1179,14 @@ class BlendCNN(nn.Module):
             )
             for n_in, n_out, k in zip(channels[:-1], channels[1:], kernel_sizes)
         ])
-        self.dense = nn.Sequential(
-            *(nn.Sequential(nn.Linear(in_features=in_f, out_features=out_f), nn.ReLU())
-              for in_f, out_f in zip((channels[-1] * len(kernel_sizes),) + n_hidden_dense, n_hidden_dense)),
-            nn.Linear(n_hidden_dense[-1], num_labels)
-        )
+        dense_sequence = [
+            nn.Sequential(nn.Linear(in_features=in_f, out_features=out_f), nn.ReLU())
+            for in_f, out_f in zip((channels[-1] * len(kernel_sizes),) + n_hidden_dense, n_hidden_dense)
+        ]
+        if use_dropout:
+            dense_sequence.append(nn.Dropout(cfg.hidden_dropout_prob))
+        dense_sequence.append(nn.Linear(n_hidden_dense[-1], num_labels))
+        self.dense = nn.Sequential(*dense_sequence)
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None):
         h = self.embeddings(input_ids, token_type_ids).transpose(1, 2)
@@ -1205,7 +1210,8 @@ class BlendCNNForSequencePairClassification(nn.Module):
                  num_labels,
                  channels,
                  kernel_sizes=5,
-                 n_hidden_dense=768):
+                 n_hidden_dense=768,
+                 use_dropout=False):
         super().__init__()
         if not isinstance(kernel_sizes, tuple) and not isinstance(kernel_sizes, list):
             kernel_sizes = (kernel_sizes,) * (len(channels) - 1)
@@ -1224,11 +1230,15 @@ class BlendCNNForSequencePairClassification(nn.Module):
             )
             for n_in, n_out, k in zip(channels[:-1], channels[1:], kernel_sizes)
         ]) for _ in range(2)])
-        self.dense = nn.Sequential(
-            *(nn.Sequential(nn.Linear(in_features=in_f, out_features=out_f), nn.ReLU())
-              for in_f, out_f in zip((channels[-1] * len(kernel_sizes) * 2,) + n_hidden_dense, n_hidden_dense)),
-            nn.Linear(n_hidden_dense[-1], num_labels)
-        )
+
+        dense_sequence = [
+            nn.Sequential(nn.Linear(in_features=in_f, out_features=out_f), nn.ReLU())
+            for in_f, out_f in zip((channels[-1] * len(kernel_sizes) * 2,) + n_hidden_dense, n_hidden_dense)
+        ]
+        if use_dropout:
+            dense_sequence.append(nn.Dropout(cfg.hidden_dropout_prob))
+        dense_sequence.append(nn.Linear(n_hidden_dense[-1], num_labels))
+        self.dense = nn.Sequential(*dense_sequence)
 
     def forward(self, input_ids, token_type_ids, attention_mask=None, labels=None):
         h = self.embeddings(input_ids, token_type_ids).transpose(1, 2)
