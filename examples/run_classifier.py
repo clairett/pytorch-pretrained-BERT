@@ -21,6 +21,7 @@ from __future__ import print_function
 
 import argparse
 import concurrent.futures
+import copy
 import csv
 import logging
 import os
@@ -41,7 +42,7 @@ from tqdm import tqdm, trange
 from pytorch_pretrained_bert import BertForSequenceClassification
 from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
 from pytorch_pretrained_bert.modeling import env_enabled, ENV_OPENAIGPT_GELU, ENV_DISABLE_APEX, BlendCNN, \
-    BlendCNNForSequencePairClassification, DISTILLER_WEIGHTS_NAME, WEIGHTS_NAME
+    BlendCNNForSequencePairClassification, DISTILLER_WEIGHTS_NAME, WEIGHTS_NAME, ACT2FN
 from pytorch_pretrained_bert.optimization import BertAdam
 from pytorch_pretrained_bert.tokenization import BertTokenizer
 
@@ -438,6 +439,10 @@ def main():
                         nargs='+',
                         default=(100,) * 8,
                         help="BlendCNN channels.")
+    parser.add_argument("--blendcnn_act",
+                        default='relu',
+                        choices=list(ACT2FN.keys()),
+                        help="BlendCNN activation function.")
     parser.add_argument('--blendcnn_dropout',
                         action='store_true',
                         help="Whether to use dropout in BlendCNN")
@@ -598,7 +603,7 @@ def main():
         model = BertForSequenceClassification.from_pretrained(args.bert_model,
                                                               state_dict=model_state_dict,
                                                               num_labels=num_labels)
-        model_config = model.config
+        model_config = copy.deepcopy(model.config)
         model_embeddings = model.bert.embeddings
         model = convert_model(args, model, device, n_gpu)
     else:
@@ -611,6 +616,7 @@ def main():
         assert model_embeddings is not None
         output_distilled_model_file = os.path.join(args.output_dir, DISTILLER_WEIGHTS_NAME)
         teacher = model
+        model_config.hidden_act = args.blendcnn_act
         if args.blendcnn_pair:
             student = BlendCNNForSequencePairClassification(model_config,
                                                             num_labels=num_labels,

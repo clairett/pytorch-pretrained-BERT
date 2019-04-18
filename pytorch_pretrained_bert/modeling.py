@@ -78,6 +78,15 @@ def swish(x):
 ACT2FN = {"gelu": gelu, "relu": torch.nn.functional.relu, "swish": swish}
 
 
+class ActivationFunction(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.func = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        return self.func(x)
+
+
 class BertConfig(object):
     """Configuration class to store the configuration of a `BertModel`.
     """
@@ -1170,21 +1179,25 @@ class BlendCNN(nn.Module):
         if not isinstance(n_hidden_dense, tuple) and not isinstance(n_hidden_dense, list):
             n_hidden_dense = (n_hidden_dense,)
 
+        self.dropout = nn.Dropout(cfg.hidden_dropout_prob) if use_dropout else None
+
+        def get_layer(layer):
+            if self.dropout:
+                return nn.Sequential(layer, ActivationFunction(cfg), self.dropout)
+            else:
+                return nn.Sequential(layer, ActivationFunction(cfg))
+
         self.num_labels = num_labels
         self.embeddings = BertEmbeddings(cfg)
         self.convs = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv1d(in_channels=n_in, out_channels=n_out, kernel_size=k, padding=k // 2),
-                nn.ReLU(),
-            )
+            get_layer(nn.Conv1d(in_channels=n_in, out_channels=n_out, kernel_size=k, padding=k // 2))
             for n_in, n_out, k in zip(channels[:-1], channels[1:], kernel_sizes)
         ])
+
         dense_sequence = [
-            nn.Sequential(nn.Linear(in_features=in_f, out_features=out_f), nn.ReLU())
+            get_layer(nn.Linear(in_features=in_f, out_features=out_f))
             for in_f, out_f in zip((channels[-1] * len(kernel_sizes),) + n_hidden_dense, n_hidden_dense)
         ]
-        if use_dropout:
-            dense_sequence.append(nn.Dropout(cfg.hidden_dropout_prob))
         dense_sequence.append(nn.Linear(n_hidden_dense[-1], num_labels))
         self.dense = nn.Sequential(*dense_sequence)
 
@@ -1221,22 +1234,25 @@ class BlendCNNForSequencePairClassification(nn.Module):
         if not isinstance(n_hidden_dense, tuple) and not isinstance(n_hidden_dense, list):
             n_hidden_dense = (n_hidden_dense,)
 
+        self.dropout = nn.Dropout(cfg.hidden_dropout_prob) if use_dropout else None
+
+        def get_layer(layer):
+            if self.dropout:
+                return nn.Sequential(layer, ActivationFunction(cfg), self.dropout)
+            else:
+                return nn.Sequential(layer, ActivationFunction(cfg))
+
         self.num_labels = num_labels
         self.embeddings = BertEmbeddings(cfg)
         self.convs = nn.ModuleList([nn.ModuleList([
-            nn.Sequential(
-                nn.Conv1d(in_channels=n_in, out_channels=n_out, kernel_size=k, padding=k // 2),
-                nn.ReLU(),
-            )
+            get_layer(nn.Conv1d(in_channels=n_in, out_channels=n_out, kernel_size=k, padding=k // 2))
             for n_in, n_out, k in zip(channels[:-1], channels[1:], kernel_sizes)
         ]) for _ in range(2)])
 
         dense_sequence = [
-            nn.Sequential(nn.Linear(in_features=in_f, out_features=out_f), nn.ReLU())
-            for in_f, out_f in zip((channels[-1] * len(kernel_sizes) * 2,) + n_hidden_dense, n_hidden_dense)
+            get_layer(nn.Linear(in_features=in_f, out_features=out_f))
+            for in_f, out_f in zip((channels[-1] * len(kernel_sizes),) + n_hidden_dense, n_hidden_dense)
         ]
-        if use_dropout:
-            dense_sequence.append(nn.Dropout(cfg.hidden_dropout_prob))
         dense_sequence.append(nn.Linear(n_hidden_dense[-1], num_labels))
         self.dense = nn.Sequential(*dense_sequence)
 
